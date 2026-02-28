@@ -291,6 +291,12 @@ body {
   box-shadow: 0 16px 35px rgba(0, 0, 0, 0.35);
 }
 
+.card--viewer {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
 .card__header {
   display: flex;
   align-items: center;
@@ -398,6 +404,23 @@ body {
   font-weight: 600;
 }
 
+.link-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 12px;
+  border: 1px solid rgba(255, 255, 255, 0.15);
+  padding: 10px 14px;
+  background: rgba(255, 255, 255, 0.08);
+  color: inherit;
+  font-weight: 600;
+  text-decoration: none;
+}
+
+.link-button:hover {
+  border-color: rgba(255, 255, 255, 0.3);
+}
+
 .actions button:disabled {
   opacity: 0.5;
   cursor: not-allowed;
@@ -412,9 +435,54 @@ body {
   color: rgba(255, 255, 255, 0.55);
 }
 
+.hints-title {
+  font-size: 0.85rem;
+  font-weight: 600;
+  color: rgba(255, 255, 255, 0.7);
+}
+
+.viewer {
+  position: relative;
+  border-radius: 16px;
+  overflow: hidden;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  min-height: 320px;
+  background: linear-gradient(135deg, rgba(6, 10, 18, 0.95), rgba(15, 18, 30, 0.95));
+}
+
+.viewer__canvas {
+  width: 100%;
+  height: 320px;
+}
+
+.viewer__overlay {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 0.85rem;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  background: rgba(6, 10, 18, 0.6);
+  color: rgba(255, 255, 255, 0.7);
+  pointer-events: none;
+  transition: opacity 0.2s ease;
+}
+
+.viewer__overlay--loading {
+  background: rgba(6, 10, 18, 0.85);
+  color: rgba(255, 190, 120, 0.9);
+  font-weight: 600;
+}
+
 @media (max-width: 720px) {
   .drop-zone {
     flex-direction: column;
     align-items: flex-start;
+  }
+
+  .viewer__canvas {
+    height: 260px;
   }
 }

@@ -1,30 +1,43 @@
-import { useMemo, useRef, useState } from 'react'
-import {
-  buildGltf,
-  buildObj,
-  buildStats,
-  pickMainDrawCall,
-  type BuiltGltf,
-  type CaptureJson,
-  type DecodeOptions,
-  type SelectedDraw,
-} from './utils/webglDump'
+import { useEffect, useMemo, useRef, useState } from 'react'
+import type { DecodeOptions } from './utils/webglDump'
 import { readCaptureFiles } from './utils/fileLoad'
-import { downloadBytes, downloadText } from './utils/download'
-import { buildGlb } from './utils/glb'
+import { downloadBytes } from './utils/download'
+import GlbViewer from './components/GlbViewer'
 
 const DEFAULT_SCALE = 0.000015259021896696422
+const USERSCRIPT_URL =
+  'https://greasyfork.org/en/scripts/567856-webgl-sniffer-dump-buffers-drawcalls-meshy-helper'
 
 type Status = { ok: boolean; message: string }
 
+type WorkerResult = {
+  type: 'result'
+  purpose: 'preview' | 'download' | 'stored'
+  stats?: unknown
+  glb?: Uint8Array
+  filename?: string
+  previewSkipped?: boolean
+  reason?: string
+}
+
+type WorkerError = {
+  type: 'error'
+  message: string
+}
+
+type WorkerMessage = WorkerResult | WorkerError
+
 function App() {
-  const [captureJson, setCaptureJson] = useState<CaptureJson | null>(null)
-  const [captureBin, setCaptureBin] = useState<ArrayBuffer | null>(null)
-  const [selected, setSelected] = useState<SelectedDraw | null>(null)
   const [status, setStatus] = useState<Status>({ ok: true, message: 'Waiting for files...' })
   const [summary, setSummary] = useState<string>('')
   const [isDragging, setIsDragging] = useState(false)
-  const [builtGltf, setBuiltGltf] = useState<BuiltGltf | null>(null)
+  const [isBuilding, setIsBuilding] = useState(false)
+  const [glbPreview, setGlbPreview] = useState<Uint8Array | null>(null)
+  const [glbFilename, setGlbFilename] = useState<string | null>(null)
+  const [previewUrl, setPreviewUrl] = useState<string | null>(null)
+  const [hasCapture, setHasCapture] = useState(false)
+  const [previewMessage, setPreviewMessage] = useState('Upload a GLB to preview it here.')
+  const [previewReady, setPreviewReady] = useState(false)
 
   const [scale, setScale] = useState(DEFAULT_SCALE)
   const [biasX, setBiasX] = useState(0)
@@ -34,8 +47,8 @@ function App() {
   const [invertZ, setInvertZ] = useState(false)
 
   const fileInputRef = useRef<HTMLInputElement | null>(null)
-
-  const ready = Boolean(captureJson && captureBin && selected)
+  const previewInputRef = useRef<HTMLInputElement | null>(null)
+  const workerRef = useRef<Worker | null>(null)
 
   const decodeOptions = useMemo<DecodeOptions>(
     () => ({
@@ -49,6 +62,57 @@ function App() {
     [scale, biasX, biasY, biasZ, swapYZ, invertZ],
   )
 
+  useEffect(() => {
+    const worker = new Worker(new URL('./workers/gltfWorker.ts', import.meta.url), { type: 'module' })
+    workerRef.current = worker
+
+    worker.onmessage = (event: MessageEvent<WorkerMessage>) => {
+      const data = event.data
+      if (data.type === 'result') {
+        if (data.stats) {
+          setSummary(JSON.stringify(data.stats, null, 2))
+        }
+
+        if (data.purpose === 'stored') {
+          setStatus({ ok: true, message: 'Capture loaded. You can download a GLB when ready.' })
+          setHasCapture(true)
+          setIsBuilding(false)
+          return
+        }
+
+        if (data.purpose === 'preview') {
+          if (data.previewSkipped) {
+            setStatus({ ok: true, message: 'Preview skipped due to size. You can still download GLB.' })
+          }
+          setHasCapture(true)
+          setIsBuilding(false)
+        }
+
+        if (data.purpose === 'download') {
+          if (data.glb && data.filename) {
+            downloadBytes(data.glb, data.filename, 'model/gltf-binary')
+            setStatus({ ok: true, message: 'Download complete. Upload the GLB to preview it.' })
+          }
+          setIsBuilding(false)
+        }
+      } else if (data.type === 'error') {
+        setStatus({ ok: false, message: data.message })
+        setIsBuilding(false)
+      }
+    }
+
+    worker.onerror = (event) => {
+      setStatus({ ok: false, message: event.message })
+      setIsBuilding(false)
+    }
+
+    return () => {
+      worker.terminate()
+      workerRef.current = null
+      if (previewUrl) URL.revokeObjectURL(previewUrl)
+    }
+  }, [previewUrl])
+
   async function handleFiles(fileList: FileList | null) {
     const files = Array.from(fileList || [])
     if (!files.length) return
@@ -60,102 +124,58 @@ function App() {
         return
       }
 
-      const picked = pickMainDrawCall(json)
-      if (!picked) {
-        setStatus({ ok: false, message: 'Could not find a suitable drawElements TRIANGLES call in JSON.' })
+      if (!workerRef.current) {
+        setStatus({ ok: false, message: 'Worker not ready. Please reload the page.' })
         return
       }
 
-      setCaptureJson(json)
-      setCaptureBin(bin)
-      setSelected(picked)
-      setBuiltGltf(null)
+      setIsBuilding(true)
+      setStatus({ ok: true, message: 'Processing capture files...' })
+      setGlbPreview(null)
+      setGlbFilename(null)
+      setHasCapture(false)
+      setPreviewReady(false)
+      setPreviewMessage('Upload a GLB to preview it here.')
 
-      const stats = buildStats(picked)
-      setSummary(JSON.stringify(stats, null, 2))
-      setStatus({ ok: true, message: 'Loaded JSON+BIN. Main draw call selected.' })
+      workerRef.current.postMessage({ type: 'store', json, bin }, [bin])
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err)
       setStatus({ ok: false, message })
+      setIsBuilding(false)
     }
-  }
-
-  function ensureReady() {
-    if (!captureJson) throw new Error('Missing JSON file.')
-    if (!captureBin) throw new Error('Missing BIN file.')
-    if (!selected) throw new Error('No draw call selected.')
-  }
-
-  function handleBuildStats() {
-    try {
-      ensureReady()
-      const stats = buildStats(selected as SelectedDraw)
-      setSummary(JSON.stringify(stats, null, 2))
-      setStatus({ ok: true, message: 'Preview stats updated.' })
-    } catch (err) {
-      const message = err instanceof Error ? err.message : String(err)
-      setStatus({ ok: false, message })
-    }
-  }
-
-  function handleBuildGltf() {
-    try {
-      ensureReady()
-      const built = buildGltf(captureBin as ArrayBuffer, selected as SelectedDraw, decodeOptions)
-      setBuiltGltf(built)
-      const stats = buildStats(selected as SelectedDraw)
-      setSummary(JSON.stringify(stats, null, 2))
-      setStatus({ ok: true, message: 'Built glTF in memory. Download .gltf and .bin.' })
-    } catch (err) {
-      const message = err instanceof Error ? err.message : String(err)
-      setStatus({ ok: false, message })
-    }
-  }
-
-  function handleBuildGlb() {
-    try {
-      ensureReady()
-      const built = buildGltf(captureBin as ArrayBuffer, selected as SelectedDraw, decodeOptions)
-      setBuiltGltf(built)
-      const glb = buildGlb(built)
-      const filename = built.filenames.gltf.replace(/\.gltf$/i, '.glb')
-      downloadBytes(glb, filename, 'model/gltf-binary')
-      const stats = buildStats(selected as SelectedDraw)
-      setSummary(JSON.stringify(stats, null, 2))
-      setStatus({ ok: true, message: 'Built and downloaded GLB.' })
-    } catch (err) {
-      const message = err instanceof Error ? err.message : String(err)
-      setStatus({ ok: false, message })
-    }
-  }
-
-  function handleDownloadGltf() {
-    if (!builtGltf) return
-    downloadText(JSON.stringify(builtGltf.gltfJsonObj, null, 2), builtGltf.filenames.gltf, 'model/gltf+json')
-  }
-
-  function handleDownloadBin() {
-    if (!builtGltf) return
-    downloadBytes(builtGltf.binU8, builtGltf.filenames.bin, 'application/octet-stream')
   }
 
   function handleDownloadGlb() {
-    if (!builtGltf) return
-    const glb = buildGlb(builtGltf)
-    const filename = builtGltf.filenames.gltf.replace(/\.gltf$/i, '.glb')
-    downloadBytes(glb, filename, 'model/gltf-binary')
+    if (!workerRef.current || !hasCapture || isBuilding) return
+
+    if (glbPreview && glbFilename) {
+      downloadBytes(glbPreview, glbFilename, 'model/gltf-binary')
+      return
+    }
+
+    setIsBuilding(true)
+    setStatus({ ok: true, message: 'Building GLB for download...' })
+    workerRef.current.postMessage({ type: 'download', options: decodeOptions })
   }
 
-  async function handleDownloadObj() {
-    try {
-      ensureReady()
-      const objText = buildObj(captureBin as ArrayBuffer, selected as SelectedDraw, decodeOptions)
-      downloadText(objText, 'mesh.obj', 'text/plain')
-      setStatus({ ok: true, message: 'OBJ export ready.' })
-    } catch (err) {
-      const message = err instanceof Error ? err.message : String(err)
-      setStatus({ ok: false, message })
+  function handlePreviewUpload(fileList: FileList | null) {
+    const file = fileList?.[0]
+    if (!file) return
+
+    if (!file.name.toLowerCase().endsWith('.glb')) {
+      setStatus({ ok: false, message: 'Please select a .glb file for preview.' })
+      return
     }
+
+    if (previewUrl) {
+      URL.revokeObjectURL(previewUrl)
+    }
+
+    const url = URL.createObjectURL(file)
+    setPreviewUrl(url)
+    setPreviewMessage('')
+    setPreviewReady(true)
+    setStatus({ ok: true, message: 'Preview loaded from uploaded GLB.' })
   }
 
   const dropZoneClass = `drop-zone ${isDragging ? 'drop-zone--active' : ''}`
@@ -165,7 +185,7 @@ function App() {
       <header className="hero">
         <div>
           <p className="eyebrow">WebGL Dump Compiler</p>
-          <h1>WebGL capture to glTF and OBJ</h1>
+          <h1>WebGL capture to GLB</h1>
           <p className="subtitle">
             Drop the capture files and export clean geometry for Blender, Three.js, or any glTF pipeline.
           </p>
@@ -173,10 +193,26 @@ function App() {
         <div className="hero-panel">
           <div className="hero-panel__line">Inputs</div>
           <div className="hero-panel__value">webgl_capture_*.json + webgl_capture_*.bin</div>
-          {/* <div className="hero-panel__line">Outputs</div>
-          <div className="hero-panel__value">.gltf + .bin, or .obj</div> */}
+          <div className="hero-panel__line">Outputs</div>
+          <div className="hero-panel__value">.glb</div>
         </div>
       </header>
+
+      <article className="card mb-5">
+        <div className="card__header">
+          <h2>Capture Helper</h2>
+          <span className="badge">Tampermonkey</span>
+        </div>
+        <p className="status">
+          Install the WebGL sniffer userscript to capture buffers and draw calls for this compiler.
+        </p>
+        <div className="actions actions--download">
+          <a className="link-button" href={USERSCRIPT_URL} target="_blank" rel="noreferrer">
+            Get Userscript
+          </a>
+        </div>
+        <p className="hint">You will need the Tampermonkey extension to install it.</p>
+      </article>
 
       <section
         className={dropZoneClass}
@@ -196,7 +232,7 @@ function App() {
           <strong>Drop both files here</strong>
           <p>webgl_capture_*.json and webgl_capture_*.bin</p>
         </div>
-        <button type="button" className="ghost-button">
+        <button type="button" className="ghost-button" disabled={isBuilding}>
           Browse files
         </button>
         <input
@@ -274,34 +310,45 @@ function App() {
             </div>
           </div>
 
-          <div className="actions">
-            <button type="button" onClick={handleBuildStats} disabled={!ready}>
-              Rebuild preview stats
-            </button>
-            {/* <button type="button" onClick={handleBuildGltf} disabled={!ready}>
-              Build glTF
-            </button> */}
-            <button type="button" onClick={handleBuildGlb} disabled={!ready}>
-              Build + Download GLB
+          <div className="actions actions--download">
+            <button type="button" onClick={handleDownloadGlb} disabled={!hasCapture || isBuilding}>
+              Download Model
             </button>
           </div>
 
-          {/* <div className="actions actions--download">
-            <button type="button" onClick={handleDownloadGltf} disabled={!builtGltf}>
-              Download .gltf
-            </button>
-            <button type="button" onClick={handleDownloadGlb} disabled={!builtGltf}>
-              Download .glb
-            </button>
-            <button type="button" onClick={handleDownloadBin} disabled={!builtGltf}>
-              Download .bin
-            </button>
-            <button type="button" onClick={handleDownloadObj} disabled={!ready}>
-              Download OBJ
-            </button>
-          </div> */}
-
           <p className="hint">The tool dequantizes positions to FLOAT for maximum compatibility.</p>
+        </article>
+
+        {/* <article className="card">
+          <div className="card__header">
+            <h2>Preview Upload</h2>
+            <span className="badge">GLB</span>
+          </div>
+          <p className="status">Upload a GLB file to preview it without building in memory.</p>
+          
+          <p className="hint">This uses a file URL to avoid heavy memory usage.</p>
+        </article> */}
+
+        <article className="card card--viewer">
+          <div className="card__header">
+            <h2>Model Preview</h2>
+            <span className="badge">{previewReady ? 'Loaded' : 'Waiting'}</span>
+          </div>
+          <GlbViewer glb={glbPreview} glbUrl={previewUrl} isLoading={isBuilding} emptyMessage={previewMessage} />
+          <p className="hint">Use the mouse to orbit and inspect the generated model.</p>
+          <div className="actions actions--download">
+            <button type="button" className="ghost-button" onClick={() => previewInputRef.current?.click()}>
+              Upload GLB
+            </button>
+            <input
+              ref={previewInputRef}
+              type="file"
+              accept=".glb"
+              hidden
+              onChange={(event) => handlePreviewUpload(event.target.files)}
+            />
+          </div>
+          <p className="status">Upload a GLB file to preview it.</p>
         </article>
       </section>
     </div>

@@ -5,7 +5,9 @@ import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js'
 
 type GlbViewerProps = {
   glb: Uint8Array | null
+  glbUrl?: string | null
   isLoading: boolean
+  emptyMessage?: string
 }
 
 type ViewerState = {
@@ -18,7 +20,7 @@ type ViewerState = {
   currentObject: THREE.Object3D | null
 }
 
-function GlbViewer({ glb, isLoading }: GlbViewerProps) {
+function GlbViewer({ glb, glbUrl, isLoading, emptyMessage }: GlbViewerProps) {
   const containerRef = useRef<HTMLDivElement | null>(null)
   const viewerRef = useRef<ViewerState | null>(null)
 
@@ -104,6 +106,22 @@ function GlbViewer({ glb, isLoading }: GlbViewerProps) {
       viewer.currentObject = null
     }
 
+    if (glbUrl) {
+      viewer.loader.load(
+        glbUrl,
+        (gltf) => {
+          viewer.currentObject = gltf.scene
+          viewer.scene.add(gltf.scene)
+          fitCameraToObject(viewer.camera, viewer.controls, gltf.scene)
+        },
+        undefined,
+        (error) => {
+          console.error('GLB load error', error)
+        },
+      )
+      return
+    }
+
     if (!glb) return
 
     const arrayBuffer = glb.buffer.slice(glb.byteOffset, glb.byteOffset + glb.byteLength)
@@ -120,18 +138,22 @@ function GlbViewer({ glb, isLoading }: GlbViewerProps) {
         console.error('GLB load error', error)
       },
     )
-  }, [glb])
+  }, [glb, glbUrl])
 
   const placeholder = useMemo(() => {
     if (isLoading) return 'Building model...'
-    if (glb) return 'Model loaded'
-    return 'Build a model to preview it here.'
-  }, [glb, isLoading])
+    if (emptyMessage) return emptyMessage
+    return 'Model will appear here after download.'
+  }, [emptyMessage, isLoading])
+
+  const showOverlay = isLoading || (!glb && !glbUrl)
 
   return (
     <div className="viewer">
       <div className="viewer__canvas" ref={containerRef} />
-      <div className={`viewer__overlay ${isLoading ? 'viewer__overlay--loading' : ''}`}>{placeholder}</div>
+      {showOverlay ? (
+        <div className={`viewer__overlay px-5 text-center ${isLoading ? 'viewer__overlay--loading' : ''}`}>{placeholder}</div>
+      ) : null}
     </div>
   )
 }
