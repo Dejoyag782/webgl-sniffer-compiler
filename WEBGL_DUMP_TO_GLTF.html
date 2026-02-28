@@ -1,0 +1,579 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>WebGL Dump → glTF</title>
+  <style>
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; margin: 20px; }
+    .drop { border: 2px dashed #888; border-radius: 12px; padding: 18px; }
+    .row { display:flex; gap:12px; flex-wrap: wrap; }
+    .card { border: 1px solid #ddd; border-radius: 12px; padding: 14px; flex: 1 1 340px; }
+    label { display:block; font-size: 12px; opacity: .8; margin-top: 10px; }
+    input, button { font: inherit; padding: 8px 10px; border-radius: 10px; border: 1px solid #ccc; }
+    button { cursor:pointer; }
+    pre { background:#f7f7f7; padding: 12px; border-radius: 12px; overflow:auto; }
+    .ok { color: #0a7; font-weight: 700; }
+    .bad { color: #c30; font-weight: 700; }
+    .small { font-size: 12px; opacity: .85; }
+  </style>
+</head>
+<body>
+  <h1>WebGL Capture → glTF</h1>
+
+  <div class="drop" id="drop">
+    <div><b>Drop both files here</b>:</div>
+    <ul>
+      <li><code>webgl_capture_*.json</code></li>
+      <li><code>webgl_capture_*.bin</code></li>
+    </ul>
+    <div class="small">Or click to choose files.</div>
+    <input id="filePicker" type="file" multiple style="display:none" />
+  </div>
+
+  <div class="row" style="margin-top:16px;">
+    <div class="card">
+      <h3>Status</h3>
+      <div id="status">Waiting for files…</div>
+      <pre id="summary"></pre>
+    </div>
+
+    <div class="card">
+      <h3>Decode settings (positions)</h3>
+
+      <label>Position scale (multiply)</label>
+      <input id="posScale" type="number" step="any" value="0.000015259021896696422" />
+      <div class="small">Default = 1/65535 (good starting point for UNSIGNED_SHORT)</div>
+
+      <label>Position bias (add)</label>
+      <div class="row">
+        <input id="biasX" type="number" step="any" value="0" />
+        <input id="biasY" type="number" step="any" value="0" />
+        <input id="biasZ" type="number" step="any" value="0" />
+      </div>
+
+      <label>Axes fixes (sometimes needed)</label>
+      <div class="row">
+        <label style="display:flex;align-items:center;gap:8px;margin-top:0">
+          <input id="swapYZ" type="checkbox" />
+          Swap Y↔Z
+        </label>
+        <label style="display:flex;align-items:center;gap:8px;margin-top:0">
+          <input id="invertZ" type="checkbox" />
+          Invert Z
+        </label>
+      </div>
+
+      <div class="row" style="margin-top:14px;">
+        <button id="build" disabled>Build glTF</button>
+        <button id="downloadGltf" disabled>Download .gltf</button>
+        <button id="downloadBin" disabled>Download .bin</button>
+      </div>
+
+      <div class="small" style="margin-top:10px;">
+        The tool dequantizes positions to FLOAT for maximum compatibility.
+      </div>
+    </div>
+  </div>
+
+<script>
+(() => {
+  let captureJson = null;
+  let captureBin = null;
+
+  let selected = null; // { draw, buffersById }
+  let built = null;    // { gltfJsonObj, binU8, filenames }
+
+  const $ = (id) => document.getElementById(id);
+
+  const statusEl = $("status");
+  const summaryEl = $("summary");
+
+  const drop = $("drop");
+  const picker = $("filePicker");
+
+  const buildBtn = $("build");
+  const dlGltfBtn = $("downloadGltf");
+  const dlBinBtn = $("downloadBin");
+
+  drop.addEventListener("click", () => picker.click());
+  picker.addEventListener("change", (e) => handleFiles(e.target.files));
+
+  drop.addEventListener("dragover", (e) => { e.preventDefault(); drop.style.borderColor = "#2b7cff"; });
+  drop.addEventListener("dragleave", () => { drop.style.borderColor = "#888"; });
+  drop.addEventListener("drop", (e) => {
+    e.preventDefault();
+    drop.style.borderColor = "#888";
+    handleFiles(e.dataTransfer.files);
+  });
+
+  buildBtn.addEventListener("click", () => {
+    try {
+      ensureReadyOrThrow();
+      built = buildGLTF();
+      renderSummary(buildStats());
+      setStatus("Built glTF in memory. Download .gltf and .bin.", true);
+      dlGltfBtn.disabled = false;
+      dlBinBtn.disabled = false;
+    } catch (err) {
+      setStatus(err?.message || String(err), false);
+      console.error(err);
+    }
+  });
+
+  dlGltfBtn.addEventListener("click", () => {
+    if (!built) return;
+    downloadText(JSON.stringify(built.gltfJsonObj, null, 2), built.filenames.gltf, "model/gltf+json");
+  });
+
+  dlBinBtn.addEventListener("click", () => {
+    if (!built) return;
+    downloadBytes(built.binU8, built.filenames.bin, "application/octet-stream");
+  });
+
+  function setStatus(msg, ok) {
+    statusEl.innerHTML = ok ? `<span class="ok">${escapeHtml(msg)}</span>` : `<span class="bad">${escapeHtml(msg)}</span>`;
+  }
+
+  function escapeHtml(s) {
+    return String(s).replace(/[&<>"']/g, (c) => ({ "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;" }[c]));
+  }
+
+  async function handleFiles(fileList) {
+    const files = Array.from(fileList || []);
+    if (!files.length) return;
+
+    try {
+      for (const f of files) {
+        if (f.name.toLowerCase().endsWith(".json")) {
+          captureJson = JSON.parse(await f.text());
+        } else if (f.name.toLowerCase().endsWith(".bin")) {
+          captureBin = await f.arrayBuffer();
+        }
+      }
+
+      if (!captureJson || !captureBin) {
+        setStatus("Please provide BOTH the .json and .bin files.", false);
+        return;
+      }
+
+      selected = pickMainDrawCall(captureJson);
+      if (!selected) {
+        setStatus("Could not find a suitable drawElements TRIANGLES call in JSON.", false);
+        return;
+      }
+
+      built = null;
+      dlGltfBtn.disabled = true;
+      dlBinBtn.disabled = true;
+
+      buildBtn.disabled = false;
+      renderSummary(buildStats());
+      setStatus("Loaded JSON+BIN. Click Build glTF.", true);
+    } catch (err) {
+      setStatus(err?.message || String(err), false);
+      console.error(err);
+    }
+  }
+
+  function ensureReadyOrThrow() {
+    if (!captureJson) throw new Error("Missing JSON file.");
+    if (!captureBin) throw new Error("Missing BIN file.");
+    if (!selected) throw new Error("No draw call selected.");
+  }
+
+  // Pick the largest drawElements with TRIANGLES mode=4
+  function pickMainDrawCall(json) {
+    const buffersById = new Map();
+    for (const b of (json.buffers || [])) buffersById.set(b.id, b);
+
+    let best = null;
+    for (const ctx of (json.contexts || [])) {
+      for (const d of (ctx.draws || [])) {
+        if (d.kind !== "drawElements") continue;
+        if (d.mode !== 4) continue;
+        if (typeof d.count !== "number") continue;
+        if (!Array.isArray(d.attribs) || !d.attribs.length) continue;
+        if (!d.elementArrayBufferId) continue;
+        if (!best || d.count > best.count) best = d;
+      }
+    }
+    if (!best) return null;
+    return { draw: best, buffersById };
+  }
+
+  function bytesPerComponent(typeEnum) {
+    switch (typeEnum) {
+      case 5120: return 1; // BYTE
+      case 5121: return 1; // UNSIGNED_BYTE
+      case 5122: return 2; // SHORT
+      case 5123: return 2; // UNSIGNED_SHORT
+      case 5124: return 4; // INT
+      case 5125: return 4; // UNSIGNED_INT
+      case 5126: return 4; // FLOAT
+      default: throw new Error("Unsupported component type enum: " + typeEnum);
+    }
+  }
+
+  function readScalar(dv, byteOffset, typeEnum, littleEndian=true) {
+    switch (typeEnum) {
+      case 5120: return dv.getInt8(byteOffset);
+      case 5121: return dv.getUint8(byteOffset);
+      case 5122: return dv.getInt16(byteOffset, littleEndian);
+      case 5123: return dv.getUint16(byteOffset, littleEndian);
+      case 5124: return dv.getInt32(byteOffset, littleEndian);
+      case 5125: return dv.getUint32(byteOffset, littleEndian);
+      case 5126: return dv.getFloat32(byteOffset, littleEndian);
+      default: throw new Error("Unsupported scalar type enum: " + typeEnum);
+    }
+  }
+
+  function normalizeInt(val, typeEnum) {
+    switch (typeEnum) {
+      case 5120: return Math.max(-1, val / 127);
+      case 5121: return val / 255;
+      case 5122: return Math.max(-1, val / 32767);
+      case 5123: return val / 65535;
+      case 5124: return Math.max(-1, val / 2147483647);
+      case 5125: return val / 4294967295;
+      default: return val;
+    }
+  }
+
+  function buildStats() {
+    const { draw, buffersById } = selected;
+    const attribs = draw.attribs.slice().sort((a,b)=>a.index-b.index);
+
+    const pos = attribs.find(a => a.size === 3 && (a.typeEnum === 5126 || (a.typeEnum === 5123 && !a.normalized)));
+    const nrm = attribs.find(a => a.size === 3 && a.normalized && (a.typeEnum === 5120 || a.typeEnum === 5122));
+    const uv  = attribs.find(a => a.size === 2 && a.normalized && (a.typeEnum === 5121 || a.typeEnum === 5123));
+
+    const posBuf = pos ? buffersById.get(pos.bufferId) : null;
+    const idxBuf = buffersById.get(draw.elementArrayBufferId);
+
+    return {
+      chosenDraw: {
+        kind: draw.kind,
+        count: draw.count,
+        indexType: draw.indexType,
+        indexTypeEnum: draw.indexTypeEnum,
+        indexOffset: draw.indexOffset,
+        elementArrayBufferId: draw.elementArrayBufferId
+      },
+      guessedSemantics: {
+        positionAttribIndex: pos?.index ?? null,
+        normalAttribIndex: nrm?.index ?? null,
+        uvAttribIndex: uv?.index ?? null,
+      },
+      buffers: {
+        position: posBuf ? { id: posBuf.id, binOffset: posBuf.binOffset, byteLength: posBuf.byteLength, stride: pos.stride, offset: pos.offset, typeEnum: pos.typeEnum, normalized: !!pos.normalized } : null,
+        index: idxBuf ? { id: idxBuf.id, binOffset: idxBuf.binOffset, byteLength: idxBuf.byteLength } : null
+      }
+    };
+  }
+
+  // ---- glTF building
+  function buildGLTF() {
+    const { draw, buffersById } = selected;
+    const dv = new DataView(captureBin);
+
+    const attribs = draw.attribs.slice().sort((a,b)=>a.index-b.index);
+
+    const posA = attribs.find(a => a.size === 3 && (a.typeEnum === 5126 || (a.typeEnum === 5123 && !a.normalized)));
+    if (!posA) throw new Error("Could not find a POSITION-like attribute (size=3).");
+
+    const nrmA = attribs.find(a => a.size === 3 && a.normalized && (a.typeEnum === 5120 || a.typeEnum === 5122));
+    const uvA  = attribs.find(a => a.size === 2 && a.normalized && (a.typeEnum === 5121 || a.typeEnum === 5123));
+
+    const posBuf = buffersById.get(posA.bufferId);
+    if (!posBuf) throw new Error("Missing position buffer entry in JSON.");
+
+    const idxBuf = buffersById.get(draw.elementArrayBufferId);
+    if (!idxBuf) throw new Error("Missing index buffer entry in JSON.");
+
+    const posStride = (posA.stride && posA.stride !== 0) ? posA.stride : (posA.size * bytesPerComponent(posA.typeEnum));
+    const posOffset = posA.offset || 0;
+    const vertexCount = Math.floor((posBuf.byteLength - posOffset) / posStride);
+
+    // Decode controls
+    const scale = Number($("posScale").value || "1");
+    const biasX = Number($("biasX").value || "0");
+    const biasY = Number($("biasY").value || "0");
+    const biasZ = Number($("biasZ").value || "0");
+    const swapYZ = $("swapYZ").checked;
+    const invertZ = $("invertZ").checked;
+
+    // ---- Indices
+    const idxType = draw.indexTypeEnum;
+    const idxBpc = bytesPerComponent(idxType);
+    const idxStart = idxBuf.binOffset + (draw.indexOffset || 0);
+    const indexCount = draw.count;
+
+    // Copy indices into Uint32Array (glTF supports UNSIGNED_INT indices)
+    const indices = new Uint32Array(indexCount);
+    for (let i = 0; i < indexCount; i++) {
+      indices[i] = readScalar(dv, idxStart + i * idxBpc, idxType);
+    }
+
+    // ---- Positions -> Float32Array
+    const positions = new Float32Array(vertexCount * 3);
+    let minX = Infinity, minY = Infinity, minZ = Infinity;
+    let maxX = -Infinity, maxY = -Infinity, maxZ = -Infinity;
+
+    const posCompBytes = bytesPerComponent(posA.typeEnum);
+
+    for (let i = 0; i < vertexCount; i++) {
+      const base = posBuf.binOffset + posOffset + i * posStride;
+
+      let x = readScalar(dv, base + 0 * posCompBytes, posA.typeEnum);
+      let y = readScalar(dv, base + 1 * posCompBytes, posA.typeEnum);
+      let z = readScalar(dv, base + 2 * posCompBytes, posA.typeEnum);
+
+      if (posA.normalized) {
+        x = normalizeInt(x, posA.typeEnum);
+        y = normalizeInt(y, posA.typeEnum);
+        z = normalizeInt(z, posA.typeEnum);
+      }
+
+      x = x * scale + biasX;
+      y = y * scale + biasY;
+      z = z * scale + biasZ;
+
+      if (swapYZ) [y, z] = [z, y];
+      if (invertZ) z = -z;
+
+      positions[i*3+0] = x;
+      positions[i*3+1] = y;
+      positions[i*3+2] = z;
+
+      minX = Math.min(minX, x); minY = Math.min(minY, y); minZ = Math.min(minZ, z);
+      maxX = Math.max(maxX, x); maxY = Math.max(maxY, y); maxZ = Math.max(maxZ, z);
+    }
+
+    // ---- Optional normals (decode normalized ints -> float)
+    let normals = null;
+    let nrmMinMax = null;
+    if (nrmA) {
+      const nrmBuf = buffersById.get(nrmA.bufferId);
+      if (nrmBuf) {
+        const nrmStride = (nrmA.stride && nrmA.stride !== 0) ? nrmA.stride : (nrmA.size * bytesPerComponent(nrmA.typeEnum));
+        const nrmOffset = nrmA.offset || 0;
+        const nrmCount = Math.min(vertexCount, Math.floor((nrmBuf.byteLength - nrmOffset) / nrmStride));
+        normals = new Float32Array(nrmCount * 3);
+
+        const nrmCompBytes = bytesPerComponent(nrmA.typeEnum);
+        for (let i = 0; i < nrmCount; i++) {
+          const base = nrmBuf.binOffset + nrmOffset + i * nrmStride;
+          let nx = readScalar(dv, base + 0*nrmCompBytes, nrmA.typeEnum);
+          let ny = readScalar(dv, base + 1*nrmCompBytes, nrmA.typeEnum);
+          let nz = readScalar(dv, base + 2*nrmCompBytes, nrmA.typeEnum);
+          if (nrmA.normalized) {
+            nx = normalizeInt(nx, nrmA.typeEnum);
+            ny = normalizeInt(ny, nrmA.typeEnum);
+            nz = normalizeInt(nz, nrmA.typeEnum);
+          }
+          normals[i*3+0] = nx;
+          normals[i*3+1] = ny;
+          normals[i*3+2] = nz;
+        }
+        nrmMinMax = { min:[-1,-1,-1], max:[1,1,1] };
+      }
+    }
+
+    // ---- Optional UVs (decode normalized unsigned -> float)
+    let uvs = null;
+    let uvMinMax = null;
+    if (uvA) {
+      const uvBuf = buffersById.get(uvA.bufferId);
+      if (uvBuf) {
+        const uvStride = (uvA.stride && uvA.stride !== 0) ? uvA.stride : (uvA.size * bytesPerComponent(uvA.typeEnum));
+        const uvOffset = uvA.offset || 0;
+        const uvCount = Math.min(vertexCount, Math.floor((uvBuf.byteLength - uvOffset) / uvStride));
+        uvs = new Float32Array(uvCount * 2);
+
+        const uvCompBytes = bytesPerComponent(uvA.typeEnum);
+        let umin=Infinity,vmin=Infinity,umax=-Infinity,vmax=-Infinity;
+
+        for (let i = 0; i < uvCount; i++) {
+          const base = uvBuf.binOffset + uvOffset + i * uvStride;
+          let u = readScalar(dv, base + 0*uvCompBytes, uvA.typeEnum);
+          let v = readScalar(dv, base + 1*uvCompBytes, uvA.typeEnum);
+          if (uvA.normalized) {
+            u = normalizeInt(u, uvA.typeEnum);
+            v = normalizeInt(v, uvA.typeEnum);
+          }
+          uvs[i*2+0] = u;
+          uvs[i*2+1] = v;
+          umin=Math.min(umin,u); vmin=Math.min(vmin,v);
+          umax=Math.max(umax,u); vmax=Math.max(vmax,v);
+        }
+        uvMinMax = { min:[umin,vmin], max:[umax,vmax] };
+      }
+    }
+
+    // ---- Pack BIN: [indices][positions][normals?][uvs?] aligned to 4 bytes
+    const chunks = [];
+    const views = {};
+    let byteOffset = 0;
+
+    function pushChunk(name, typedArray) {
+      // Ensure 4-byte alignment
+      const align = 4;
+      const pad = (align - (byteOffset % align)) % align;
+      if (pad) {
+        chunks.push(new Uint8Array(pad));
+        byteOffset += pad;
+      }
+      const u8 = new Uint8Array(typedArray.buffer, typedArray.byteOffset, typedArray.byteLength);
+      views[name] = { byteOffset, byteLength: u8.byteLength };
+      chunks.push(u8);
+      byteOffset += u8.byteLength;
+    }
+
+    pushChunk("indices", indices);
+    pushChunk("positions", positions);
+    if (normals) pushChunk("normals", normals);
+    if (uvs) pushChunk("uvs", uvs);
+
+    const binU8 = concatU8(chunks);
+
+    // ---- glTF JSON
+    const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+    const binName = `mesh_${stamp}.bin`;
+    const gltfName = `mesh_${stamp}.gltf`;
+
+    const bufferViews = [];
+    const accessors = [];
+
+    function addBufferView(name, target) {
+      const v = views[name];
+      const idx = bufferViews.length;
+      bufferViews.push({
+        buffer: 0,
+        byteOffset: v.byteOffset,
+        byteLength: v.byteLength,
+        ...(target ? { target } : {})
+      });
+      return idx;
+    }
+
+    function addAccessor({ bufferView, componentType, count, type, min, max, normalized }) {
+      const idx = accessors.length;
+      const a = { bufferView, componentType, count, type };
+      if (min) a.min = min;
+      if (max) a.max = max;
+      if (normalized) a.normalized = true;
+      accessors.push(a);
+      return idx;
+    }
+
+    // Targets: ELEMENT_ARRAY_BUFFER=34963, ARRAY_BUFFER=34962
+    const bvIndices   = addBufferView("indices", 34963);
+    const bvPositions = addBufferView("positions", 34962);
+    const bvNormals   = normals ? addBufferView("normals", 34962) : null;
+    const bvUVs       = uvs ? addBufferView("uvs", 34962) : null;
+
+    const accIndices = addAccessor({
+      bufferView: bvIndices,
+      componentType: 5125, // UNSIGNED_INT
+      count: indices.length,
+      type: "SCALAR",
+      min: [0],
+      max: [maxOfU32(indices)]
+    });
+
+    const accPos = addAccessor({
+      bufferView: bvPositions,
+      componentType: 5126, // FLOAT
+      count: vertexCount,
+      type: "VEC3",
+      min: [minX, minY, minZ],
+      max: [maxX, maxY, maxZ]
+    });
+
+    const accNrm = normals ? addAccessor({
+      bufferView: bvNormals,
+      componentType: 5126,
+      count: normals.length / 3,
+      type: "VEC3",
+      min: nrmMinMax.min,
+      max: nrmMinMax.max
+    }) : null;
+
+    const accUV = uvs ? addAccessor({
+      bufferView: bvUVs,
+      componentType: 5126,
+      count: uvs.length / 2,
+      type: "VEC2",
+      min: uvMinMax.min,
+      max: uvMinMax.max
+    }) : null;
+
+    const attributes = { POSITION: accPos };
+    if (accNrm !== null) attributes.NORMAL = accNrm;
+    if (accUV !== null) attributes.TEXCOORD_0 = accUV;
+
+    const gltf = {
+      asset: { version: "2.0", generator: "WebGLDumpToGLTF" },
+      scene: 0,
+      scenes: [{ nodes: [0] }],
+      nodes: [{ mesh: 0, name: "CapturedMesh" }],
+      meshes: [{
+        primitives: [{
+          attributes,
+          indices: accIndices,
+          mode: 4
+        }]
+      }],
+      buffers: [{ uri: binName, byteLength: binU8.byteLength }],
+      bufferViews,
+      accessors
+    };
+
+    return { gltfJsonObj: gltf, binU8, filenames: { gltf: gltfName, bin: binName } };
+  }
+
+  function concatU8(chunks) {
+    let total = 0;
+    for (const c of chunks) total += c.byteLength;
+    const out = new Uint8Array(total);
+    let off = 0;
+    for (const c of chunks) { out.set(c, off); off += c.byteLength; }
+    return out;
+  }
+
+  function maxOfU32(u32) {
+    let m = 0;
+    for (let i = 0; i < u32.length; i++) if (u32[i] > m) m = u32[i];
+    return m;
+  }
+
+  function renderSummary(obj) {
+    summaryEl.textContent = JSON.stringify(obj, null, 2);
+  }
+
+  function downloadText(text, filename, mime) {
+    const blob = new Blob([text], { type: mime || "text/plain" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    setTimeout(() => { URL.revokeObjectURL(url); a.remove(); }, 20000);
+  }
+
+  function downloadBytes(u8, filename, mime) {
+    const blob = new Blob([u8], { type: mime || "application/octet-stream" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    setTimeout(() => { URL.revokeObjectURL(url); a.remove(); }, 20000);
+  }
+})();
+</script>
+</body>
+</html>

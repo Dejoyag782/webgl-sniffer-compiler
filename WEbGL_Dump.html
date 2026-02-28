@@ -1,0 +1,466 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>WebGL Dump → OBJ</title>
+  <style>
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; margin: 20px; }
+    .drop { border: 2px dashed #888; border-radius: 12px; padding: 18px; }
+    .row { display:flex; gap:12px; flex-wrap: wrap; }
+    .card { border: 1px solid #ddd; border-radius: 12px; padding: 14px; flex: 1 1 320px; }
+    label { display:block; font-size: 12px; opacity: .8; margin-top: 10px; }
+    input, select, button { font: inherit; padding: 8px 10px; border-radius: 10px; border: 1px solid #ccc; }
+    button { cursor:pointer; }
+    pre { background:#f7f7f7; padding: 12px; border-radius: 12px; overflow:auto; }
+    .ok { color: #0a7; font-weight: 700; }
+    .bad { color: #c30; font-weight: 700; }
+    .small { font-size: 12px; opacity: .85; }
+  </style>
+</head>
+<body>
+  <h1>WebGL Capture → OBJ</h1>
+
+  <div class="drop" id="drop">
+    <div><b>Drop both files here</b>:</div>
+    <ul>
+      <li><code>webgl_capture_*.json</code></li>
+      <li><code>webgl_capture_*.bin</code></li>
+    </ul>
+    <div class="small">Or click to choose files.</div>
+    <input id="filePicker" type="file" multiple style="display:none" />
+  </div>
+
+  <div class="row" style="margin-top:16px;">
+    <div class="card">
+      <h3>Status</h3>
+      <div id="status">Waiting for files…</div>
+      <pre id="summary"></pre>
+    </div>
+
+    <div class="card">
+      <h3>Decode settings (positions)</h3>
+
+      <label>Position scale (multiply)</label>
+      <input id="posScale" type="number" step="any" value="0.000015259021896696422" />
+      <div class="small">Default = 1/65535 (good starting point for UNSIGNED_SHORT)</div>
+
+      <label>Position bias (add)</label>
+      <div class="row">
+        <input id="biasX" type="number" step="any" value="0" />
+        <input id="biasY" type="number" step="any" value="0" />
+        <input id="biasZ" type="number" step="any" value="0" />
+      </div>
+
+      <label>Flip Y/Z (sometimes needed)</label>
+      <div class="row">
+        <label style="display:flex;align-items:center;gap:8px;margin-top:0">
+          <input id="swapYZ" type="checkbox" />
+          Swap Y↔Z
+        </label>
+        <label style="display:flex;align-items:center;gap:8px;margin-top:0">
+          <input id="invertZ" type="checkbox" />
+          Invert Z
+        </label>
+      </div>
+
+      <div class="row" style="margin-top:14px;">
+        <button id="downloadObj" disabled>Download OBJ</button>
+        <button id="rebuild" disabled>Rebuild preview stats</button>
+      </div>
+      <div class="small" style="margin-top:10px;">
+        Tip: if the mesh is “exploded” in Blender, your stride/attribute mapping might be different (or the chosen draw call isn’t the main mesh).
+      </div>
+    </div>
+  </div>
+
+<script>
+(() => {
+  /** @type {null | any} */
+  let captureJson = null;
+  /** @type {null | ArrayBuffer} */
+  let captureBin = null;
+
+  /** @type {null | {draw:any, buffersById: Map<number, any>} } */
+  let selected = null;
+
+  const $ = (id) => document.getElementById(id);
+
+  const statusEl = $("status");
+  const summaryEl = $("summary");
+  const downloadBtn = $("downloadObj");
+  const rebuildBtn = $("rebuild");
+
+  const drop = $("drop");
+  const picker = $("filePicker");
+
+  drop.addEventListener("click", () => picker.click());
+  picker.addEventListener("change", (e) => handleFiles(e.target.files));
+
+  drop.addEventListener("dragover", (e) => { e.preventDefault(); drop.style.borderColor = "#2b7cff"; });
+  drop.addEventListener("dragleave", () => { drop.style.borderColor = "#888"; });
+  drop.addEventListener("drop", (e) => {
+    e.preventDefault();
+    drop.style.borderColor = "#888";
+    handleFiles(e.dataTransfer.files);
+  });
+
+  rebuildBtn.addEventListener("click", () => {
+    try {
+      ensureReadyOrThrow();
+      const info = buildStatsOnly();
+      renderSummary(info);
+      setStatus("Ready. You can download OBJ.", true);
+    } catch (err) {
+      setStatus(err?.message || String(err), false);
+    }
+  });
+
+  downloadBtn.addEventListener("click", async () => {
+    try {
+      ensureReadyOrThrow();
+      const objText = await buildOBJ();
+      downloadText(objText, "mesh.obj", "text/plain");
+    } catch (err) {
+      setStatus(err?.message || String(err), false);
+    }
+  });
+
+  function setStatus(msg, ok) {
+    statusEl.innerHTML = ok ? `<span class="ok">${escapeHtml(msg)}</span>` : `<span class="bad">${escapeHtml(msg)}</span>`;
+  }
+
+  function escapeHtml(s) {
+    return String(s).replace(/[&<>"']/g, (c) => ({ "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;" }[c]));
+  }
+
+  async function handleFiles(fileList) {
+    const files = Array.from(fileList || []);
+    if (!files.length) return;
+
+    try {
+      for (const f of files) {
+        if (f.name.toLowerCase().endsWith(".json")) {
+          captureJson = JSON.parse(await f.text());
+        } else if (f.name.toLowerCase().endsWith(".bin")) {
+          captureBin = await f.arrayBuffer();
+        }
+      }
+
+      if (!captureJson || !captureBin) {
+        setStatus("Please provide BOTH the .json and .bin files.", false);
+        return;
+      }
+
+      selected = pickMainDrawCall(captureJson);
+      if (!selected) {
+        setStatus("Could not find a suitable drawElements TRIANGLES call in JSON.", false);
+        return;
+      }
+
+      const info = buildStatsOnly();
+      renderSummary(info);
+
+      downloadBtn.disabled = false;
+      rebuildBtn.disabled = false;
+      setStatus("Loaded JSON+BIN. Main draw call selected.", true);
+    } catch (err) {
+      setStatus(err?.message || String(err), false);
+      console.error(err);
+    }
+  }
+
+  function ensureReadyOrThrow() {
+    if (!captureJson) throw new Error("Missing JSON file.");
+    if (!captureBin) throw new Error("Missing BIN file.");
+    if (!selected) throw new Error("No draw call selected.");
+  }
+
+  // Pick the largest drawElements with mode=4 (TRIANGLES)
+  function pickMainDrawCall(json) {
+    const buffersById = new Map();
+    for (const b of (json.buffers || [])) buffersById.set(b.id, b);
+
+    let best = null;
+    for (const ctx of (json.contexts || [])) {
+      for (const d of (ctx.draws || [])) {
+        if (d.kind !== "drawElements") continue;
+        if (d.mode !== 4) continue; // TRIANGLES
+        if (typeof d.count !== "number") continue;
+        if (!Array.isArray(d.attribs) || !d.attribs.length) continue;
+        if (!d.elementArrayBufferId) continue;
+
+        if (!best || d.count > best.count) best = d;
+      }
+    }
+    if (!best) return null;
+    return { draw: best, buffersById };
+  }
+
+  function bytesPerComponent(typeEnum) {
+    // WebGL enums
+    switch (typeEnum) {
+      case 5120: return 1; // BYTE
+      case 5121: return 1; // UNSIGNED_BYTE
+      case 5122: return 2; // SHORT
+      case 5123: return 2; // UNSIGNED_SHORT
+      case 5124: return 4; // INT
+      case 5125: return 4; // UNSIGNED_INT
+      case 5126: return 4; // FLOAT
+      default: throw new Error("Unsupported component type enum: " + typeEnum);
+    }
+  }
+
+  function readScalar(dv, byteOffset, typeEnum, littleEndian=true) {
+    switch (typeEnum) {
+      case 5120: return dv.getInt8(byteOffset);
+      case 5121: return dv.getUint8(byteOffset);
+      case 5122: return dv.getInt16(byteOffset, littleEndian);
+      case 5123: return dv.getUint16(byteOffset, littleEndian);
+      case 5124: return dv.getInt32(byteOffset, littleEndian);
+      case 5125: return dv.getUint32(byteOffset, littleEndian);
+      case 5126: return dv.getFloat32(byteOffset, littleEndian);
+      default: throw new Error("Unsupported scalar type enum: " + typeEnum);
+    }
+  }
+
+  function normalizeInt(val, typeEnum) {
+    // If normalized=true in WebGL: map ints to [-1..1] or [0..1]
+    switch (typeEnum) {
+      case 5120: return Math.max(-1, val / 127); // BYTE
+      case 5121: return val / 255; // UBYTE
+      case 5122: return Math.max(-1, val / 32767); // SHORT
+      case 5123: return val / 65535; // USHORT
+      case 5124: return Math.max(-1, val / 2147483647); // INT
+      case 5125: return val / 4294967295; // UINT
+      default: return val;
+    }
+  }
+
+  function renderSummary(info) {
+    summaryEl.textContent = JSON.stringify(info, null, 2);
+  }
+
+  function buildStatsOnly() {
+    const { draw, buffersById } = selected;
+
+    // Identify likely semantics by typical patterns:
+    // - POSITION: size=3 and (FLOAT or UNSIGNED_SHORT not normalized)
+    // - NORMAL: size=3 and normalized signed (BYTE/SHORT)
+    // - TEXCOORD_0: size=2 and normalized unsigned
+    const attribs = draw.attribs.slice().sort((a,b)=>a.index-b.index);
+
+    const pos = attribs.find(a => a.size === 3 && (a.typeEnum === 5126 || (a.typeEnum === 5123 && !a.normalized)));
+    const nrm = attribs.find(a => a.size === 3 && a.normalized && (a.typeEnum === 5120 || a.typeEnum === 5122));
+    const uv  = attribs.find(a => a.size === 2 && a.normalized && (a.typeEnum === 5121 || a.typeEnum === 5123));
+
+    const posBuf = pos ? buffersById.get(pos.bufferId) : null;
+    const idxBuf = buffersById.get(draw.elementArrayBufferId);
+
+    const idxBytes = bytesPerComponent(draw.indexTypeEnum) * draw.count;
+
+    return {
+      chosenDraw: {
+        kind: draw.kind,
+        mode: draw.mode,
+        count: draw.count,
+        indexType: draw.indexType,
+        indexTypeEnum: draw.indexTypeEnum,
+        indexOffset: draw.indexOffset,
+        elementArrayBufferId: draw.elementArrayBufferId
+      },
+      guessedSemantics: {
+        positionAttribIndex: pos?.index ?? null,
+        normalAttribIndex: nrm?.index ?? null,
+        uvAttribIndex: uv?.index ?? null,
+      },
+      buffers: {
+        position: posBuf ? { id: posBuf.id, binOffset: posBuf.binOffset, byteLength: posBuf.byteLength, stride: pos.stride, offset: pos.offset, typeEnum: pos.typeEnum, normalized: !!pos.normalized } : null,
+        index: idxBuf ? { id: idxBuf.id, binOffset: idxBuf.binOffset, byteLength: idxBuf.byteLength, requiredBytes: idxBytes } : null
+      },
+      note: "If position type is UNSIGNED_SHORT, you likely need correct scale+bias to dequantize."
+    };
+  }
+
+  async function buildOBJ() {
+    const { draw, buffersById } = selected;
+    const bin = captureBin;
+    const dv = new DataView(bin);
+
+    const attribs = draw.attribs.slice().sort((a,b)=>a.index-b.index);
+
+    const posA = attribs.find(a => a.size === 3 && (a.typeEnum === 5126 || (a.typeEnum === 5123 && !a.normalized)));
+    if (!posA) throw new Error("Could not find a POSITION-like attribute (size=3).");
+
+    const nrmA = attribs.find(a => a.size === 3 && a.normalized && (a.typeEnum === 5120 || a.typeEnum === 5122));
+    const uvA  = attribs.find(a => a.size === 2 && a.normalized && (a.typeEnum === 5121 || a.typeEnum === 5123));
+
+    const posBuf = buffersById.get(posA.bufferId);
+    if (!posBuf) throw new Error("Missing position buffer entry in JSON.");
+
+    const idxBuf = buffersById.get(draw.elementArrayBufferId);
+    if (!idxBuf) throw new Error("Missing index buffer entry in JSON.");
+
+    // ---- Indices
+    const idxType = draw.indexTypeEnum;
+    const idxBpc = bytesPerComponent(idxType);
+
+    // NOTE: draw.indexOffset is in bytes.
+    const idxStart = idxBuf.binOffset + (draw.indexOffset || 0);
+    const idxCount = draw.count;
+
+    // ---- Vertex count:
+    // We can't know exact vertex count used by the draw without scanning indices;
+    // We'll decode entire position buffer as "all vertices".
+    const posStride = (posA.stride && posA.stride !== 0) ? posA.stride : (posA.size * bytesPerComponent(posA.typeEnum));
+    const posOffset = posA.offset || 0;
+
+    const posVertCount = Math.floor((posBuf.byteLength - posOffset) / posStride);
+
+    // ---- Decode controls
+    const scale = Number($("posScale").value || "1");
+    const biasX = Number($("biasX").value || "0");
+    const biasY = Number($("biasY").value || "0");
+    const biasZ = Number($("biasZ").value || "0");
+    const swapYZ = $("swapYZ").checked;
+    const invertZ = $("invertZ").checked;
+
+    // ---- Decode positions
+    const vertices = new Array(posVertCount);
+    for (let i = 0; i < posVertCount; i++) {
+      const base = posBuf.binOffset + posOffset + i * posStride;
+
+      let x = readScalar(dv, base + 0 * bytesPerComponent(posA.typeEnum), posA.typeEnum);
+      let y = readScalar(dv, base + 1 * bytesPerComponent(posA.typeEnum), posA.typeEnum);
+      let z = readScalar(dv, base + 2 * bytesPerComponent(posA.typeEnum), posA.typeEnum);
+
+      // If the attribute itself was normalized, apply it (rare for positions)
+      if (posA.normalized) {
+        x = normalizeInt(x, posA.typeEnum);
+        y = normalizeInt(y, posA.typeEnum);
+        z = normalizeInt(z, posA.typeEnum);
+      }
+
+      // Apply user dequantization
+      x = x * scale + biasX;
+      y = y * scale + biasY;
+      z = z * scale + biasZ;
+
+      if (swapYZ) [y, z] = [z, y];
+      if (invertZ) z = -z;
+
+      vertices[i] = [x, y, z];
+    }
+
+    // ---- Decode optional normals
+    let normals = null;
+    if (nrmA) {
+      const nrmBuf = buffersById.get(nrmA.bufferId);
+      if (nrmBuf) {
+        const nrmStride = (nrmA.stride && nrmA.stride !== 0) ? nrmA.stride : (nrmA.size * bytesPerComponent(nrmA.typeEnum));
+        const nrmOffset = nrmA.offset || 0;
+        const nrmVertCount = Math.min(posVertCount, Math.floor((nrmBuf.byteLength - nrmOffset) / nrmStride));
+        normals = new Array(nrmVertCount);
+
+        for (let i = 0; i < nrmVertCount; i++) {
+          const base = nrmBuf.binOffset + nrmOffset + i * nrmStride;
+          let nx = readScalar(dv, base + 0 * bytesPerComponent(nrmA.typeEnum), nrmA.typeEnum);
+          let ny = readScalar(dv, base + 1 * bytesPerComponent(nrmA.typeEnum), nrmA.typeEnum);
+          let nz = readScalar(dv, base + 2 * bytesPerComponent(nrmA.typeEnum), nrmA.typeEnum);
+          if (nrmA.normalized) {
+            nx = normalizeInt(nx, nrmA.typeEnum);
+            ny = normalizeInt(ny, nrmA.typeEnum);
+            nz = normalizeInt(nz, nrmA.typeEnum);
+          }
+          normals[i] = [nx, ny, nz];
+        }
+      }
+    }
+
+    // ---- Decode optional UVs
+    let uvs = null;
+    if (uvA) {
+      const uvBuf = buffersById.get(uvA.bufferId);
+      if (uvBuf) {
+        const uvStride = (uvA.stride && uvA.stride !== 0) ? uvA.stride : (uvA.size * bytesPerComponent(uvA.typeEnum));
+        const uvOffset = uvA.offset || 0;
+        const uvVertCount = Math.min(posVertCount, Math.floor((uvBuf.byteLength - uvOffset) / uvStride));
+        uvs = new Array(uvVertCount);
+
+        for (let i = 0; i < uvVertCount; i++) {
+          const base = uvBuf.binOffset + uvOffset + i * uvStride;
+          let u = readScalar(dv, base + 0 * bytesPerComponent(uvA.typeEnum), uvA.typeEnum);
+          let v = readScalar(dv, base + 1 * bytesPerComponent(uvA.typeEnum), uvA.typeEnum);
+          if (uvA.normalized) {
+            u = normalizeInt(u, uvA.typeEnum);
+            v = normalizeInt(v, uvA.typeEnum);
+          }
+          // OBJ UV origin differences are common; you can flip V in Blender if needed.
+          uvs[i] = [u, v];
+        }
+      }
+    }
+
+    // ---- Read indices into array
+    const indices = new Array(idxCount);
+    for (let i = 0; i < idxCount; i++) {
+      const off = idxStart + i * idxBpc;
+      indices[i] = readScalar(dv, off, idxType);
+    }
+
+    // ---- Build OBJ
+    // We’ll output v/vt/vn per vertex index (simple 1:1 mapping).
+    // Faces reference the same index for v/vt/vn if available.
+    let out = "";
+    out += `# Generated from WebGL capture\n`;
+    out += `# vertices: ${vertices.length}\n`;
+    out += `# indices: ${indices.length} (triangles: ${Math.floor(indices.length/3)})\n\n`;
+
+    for (const v of vertices) out += `v ${v[0]} ${v[1]} ${v[2]}\n`;
+    if (uvs) for (const t of uvs) out += `vt ${t[0]} ${t[1]}\n`;
+    if (normals) for (const n of normals) out += `vn ${n[0]} ${n[1]} ${n[2]}\n`;
+
+    out += `\n`;
+
+    const haveVT = !!uvs;
+    const haveVN = !!normals;
+
+    for (let i = 0; i < indices.length; i += 3) {
+      // OBJ is 1-based
+      const a = indices[i] + 1;
+      const b = indices[i + 1] + 1;
+      const c = indices[i + 2] + 1;
+
+      // Clamp to existing arrays (prevents crashing if indices refer to a subset)
+      const A = Math.max(1, Math.min(a, vertices.length));
+      const B = Math.max(1, Math.min(b, vertices.length));
+      const C = Math.max(1, Math.min(c, vertices.length));
+
+      if (haveVT && haveVN) {
+        out += `f ${A}/${A}/${A} ${B}/${B}/${B} ${C}/${C}/${C}\n`;
+      } else if (haveVT && !haveVN) {
+        out += `f ${A}/${A} ${B}/${B} ${C}/${C}\n`;
+      } else if (!haveVT && haveVN) {
+        out += `f ${A}//${A} ${B}//${B} ${C}//${C}\n`;
+      } else {
+        out += `f ${A} ${B} ${C}\n`;
+      }
+    }
+
+    return out;
+  }
+
+  function downloadText(text, filename, mime) {
+    const blob = new Blob([text], { type: mime || "text/plain" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    setTimeout(() => { URL.revokeObjectURL(url); a.remove(); }, 20000);
+  }
+})();
+</script>
+</body>
+</html>
