@@ -11,13 +11,13 @@ type GlbViewerProps = {
 }
 
 type ViewerState = {
-  renderer: THREE.WebGLRenderer
-  scene: THREE.Scene
-  camera: THREE.PerspectiveCamera
+  renderer: any
+  scene: any
+  camera: any
   controls: OrbitControls
   loader: GLTFLoader
   animationId: number | null
-  currentObject: THREE.Object3D | null
+  currentObject: any | null
 }
 
 function GlbViewer({ glb, glbUrl, isLoading, emptyMessage }: GlbViewerProps) {
@@ -109,13 +109,13 @@ function GlbViewer({ glb, glbUrl, isLoading, emptyMessage }: GlbViewerProps) {
     if (glbUrl) {
       viewer.loader.load(
         glbUrl,
-        (gltf) => {
+        (gltf: { scene: any }) => {
           viewer.currentObject = gltf.scene
           viewer.scene.add(gltf.scene)
           fitCameraToObject(viewer.camera, viewer.controls, gltf.scene)
         },
         undefined,
-        (error) => {
+        (error: unknown) => {
           console.error('GLB load error', error)
         },
       )
@@ -124,17 +124,17 @@ function GlbViewer({ glb, glbUrl, isLoading, emptyMessage }: GlbViewerProps) {
 
     if (!glb) return
 
-    const arrayBuffer = glb.buffer.slice(glb.byteOffset, glb.byteOffset + glb.byteLength)
+    const arrayBuffer = new Uint8Array(glb).buffer
 
     viewer.loader.parse(
       arrayBuffer,
       '',
-      (gltf) => {
+      (gltf: { scene: any }) => {
         viewer.currentObject = gltf.scene
         viewer.scene.add(gltf.scene)
         fitCameraToObject(viewer.camera, viewer.controls, gltf.scene)
       },
-      (error) => {
+      (error: unknown) => {
         console.error('GLB load error', error)
       },
     )
@@ -158,7 +158,7 @@ function GlbViewer({ glb, glbUrl, isLoading, emptyMessage }: GlbViewerProps) {
   )
 }
 
-function fitCameraToObject(camera: THREE.PerspectiveCamera, controls: OrbitControls, object: THREE.Object3D) {
+function fitCameraToObject(camera: any, controls: OrbitControls, object: any) {
   const box = new THREE.Box3().setFromObject(object)
   const size = box.getSize(new THREE.Vector3())
   const center = box.getCenter(new THREE.Vector3())
@@ -177,12 +177,12 @@ function fitCameraToObject(camera: THREE.PerspectiveCamera, controls: OrbitContr
   controls.update()
 }
 
-function disposeObject(object: THREE.Object3D) {
-  object.traverse((child) => {
+function disposeObject(object: any) {
+  object.traverse((child: any) => {
     if (child instanceof THREE.Mesh) {
       child.geometry.dispose()
       if (Array.isArray(child.material)) {
-        child.material.forEach((material) => material.dispose())
+        child.material.forEach((material: any) => material.dispose())
       } else {
         child.material.dispose()
       }

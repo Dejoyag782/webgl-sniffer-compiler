@@ -13,7 +13,8 @@ export function downloadText(text: string, filename: string, mime = 'text/plain'
 }
 
 export function downloadBytes(u8: Uint8Array, filename: string, mime = 'application/octet-stream') {
-  const blob = new Blob([u8], { type: mime })
+  const bytes = new Uint8Array(u8)
+  const blob = new Blob([bytes.buffer], { type: mime })
   const url = URL.createObjectURL(blob)
   const anchor = document.createElement('a')
   anchor.href = url
